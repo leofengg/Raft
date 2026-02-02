@@ -35,6 +35,9 @@ type Raft struct {
 	//channels
 	Heartbeat    chan bool
 	BecameLeader chan bool
+
+	//testing
+	dead bool
 }
 
 func NewRaft(id int, peers []string, applyCh chan LogEntry) *Raft {
@@ -49,6 +52,7 @@ func NewRaft(id int, peers []string, applyCh chan LogEntry) *Raft {
 		currentTerm:      0,
 		Heartbeat:        make(chan bool, 1),
 		BecameLeader:     make(chan bool, 1),
+		dead:             false,
 	}
 	dummyLog := &LogEntry{term: 0}
 	rf.logEntries = append(rf.logEntries, *dummyLog)
@@ -58,7 +62,6 @@ func NewRaft(id int, peers []string, applyCh chan LogEntry) *Raft {
 }
 
 func (rf *Raft) StartElection() {
-
 	rf.role = string(Candidate)
 	req := &RequestVoteArgs{
 		Term:         rf.currentTerm,
@@ -68,7 +71,7 @@ func (rf *Raft) StartElection() {
 	}
 
 	for i := range rf.peers {
-		if rf.PeerRaft[i].id == rf.id {
+		if rf.PeerRaft[i].id == rf.id && !rf.PeerRaft[i].IsDead() {
 			continue
 		}
 
@@ -86,7 +89,10 @@ func (rf *Raft) StartElection() {
 			if reply.VoteGranted {
 				rf.votes++
 				if rf.votes > len(rf.peers)/(2+1) {
-					rf.BecameLeader <- true
+					select {
+					case rf.BecameLeader <- true:
+					default:
+					}
 				}
 				return
 			}
@@ -97,15 +103,13 @@ func (rf *Raft) StartElection() {
 	fmt.Println(rf.id, "starting election", rf.role)
 }
 
-func (rf *Raft) sendRequestVote(req *RequestVoteArgs, reply *RequestVoteReply) {
-	for i := 0; i < len(rf.peers)-1; i++ {
-		if rf.PeerRaft[i].id != rf.id {
-			go rf.PeerRaft[i].HandleRequestVote(req, reply)
-		}
-	}
-}
-
 func (rf *Raft) HandleRequestVote(req *RequestVoteArgs, reply *RequestVoteReply) {
+
+	if rf.IsDead() {
+		fmt.Println(rf.id, "am dead")
+		reply.VoteGranted = false
+		return
+	}
 	fmt.Println(rf.id, "raft recieving vote request from", req.CandidateID)
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
@@ -146,7 +150,7 @@ func (rf *Raft) HandleRequestVote(req *RequestVoteArgs, reply *RequestVoteReply)
 func (rf *Raft) HandleAppendEntries(args *AppendEntriesArgs) *AppendEntriesReply {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	fmt.Println(rf.id, "HANDLING APPEND ENTRIES ON FIRST HEARTBEAT", rf.role)
+	// fmt.Println(rf.id, "HANDLING APPEND ENTRIES ON FIRST HEARTBEAT", rf.role)
 	reply := &AppendEntriesReply{Term: rf.currentTerm}
 	if args.Term < rf.currentTerm {
 		reply.Success = false
@@ -162,7 +166,10 @@ func (rf *Raft) HandleAppendEntries(args *AppendEntriesArgs) *AppendEntriesReply
 	reply.Success = true
 	reply.Term = rf.currentTerm
 
-	rf.Heartbeat <- true
+	select {
+	case rf.Heartbeat <- true:
+	default:
+	}
 
 	return reply
 }
@@ -209,14 +216,26 @@ func (rf *Raft) sendInitialHeartbeat() {
 	}
 
 	for peer := range rf.PeerRaft {
-		if rf.PeerRaft[peer].id != rf.id {
+		if rf.PeerRaft[peer].id != rf.id && !rf.PeerRaft[peer].IsDead() {
+			fmt.Println("sending heartbeat to", rf.PeerRaft[peer].id)
 			go rf.sendHeartbeat(rf.PeerRaft[peer], args)
 		}
 	}
 }
 
+func (rf *Raft) becomeFollower() {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	rf.role = string(Follower)
+}
+
 func (rf *Raft) ticker() {
 	for {
+
+		if rf.IsDead() {
+			return
+		}
+
 		switch rf.role {
 		case string(Leader):
 			time.Sleep(rf.heartbeatTimeout)
@@ -227,6 +246,8 @@ func (rf *Raft) ticker() {
 				rf.mu.Lock()
 				rf.MakeLeader()
 				rf.mu.Unlock()
+			case <-time.After(rf.electionTimeout):
+				rf.becomeFollower()
 			}
 		case string(Follower):
 			select {
@@ -236,4 +257,31 @@ func (rf *Raft) ticker() {
 			}
 		}
 	}
+}
+
+// testing
+func (rf *Raft) Kill() {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	rf.dead = true
+	fmt.Println("Raft", rf.id, "killed")
+}
+
+func (rf *Raft) IsDead() bool {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	return rf.dead
+}
+
+func (rf *Raft) IsLeader() bool {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	if rf.role == string(Leader) {
+		return true
+	}
+	return false
+}
+
+func (rf *Raft) ID() int {
+	return rf.id
 }
