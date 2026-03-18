@@ -13,5 +13,5 @@ const (
 type LogEntry struct {
 	term     int
 	logIndex int
-	command  string
+	Command  string
 }

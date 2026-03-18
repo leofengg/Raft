@@ -85,7 +85,7 @@ func (rf *Raft) StartElection() {
 		if rf.PeerRaft[i].id == rf.id && !rf.PeerRaft[i].IsDead() {
 			continue
 		}
-
+		i := i
 		go func() {
 			reply := &RequestVoteReply{}
 			rf.PeerRaft[i].HandleRequestVote(req, reply)
@@ -167,11 +167,12 @@ func (rf *Raft) HandleRequestVote(req *RequestVoteArgs, reply *RequestVoteReply)
 
 func (rf *Raft) HandleAppendEntries(args *AppendEntriesArgs) *AppendEntriesReply {
 	rf.mu.Lock()
-	defer rf.mu.Unlock()
-	// fmt.Println(rf.id, "HANDLING APPEND ENTRIES ON FIRST HEARTBEAT", rf.role)
+
 	reply := &AppendEntriesReply{Term: rf.currentTerm}
+
 	if args.Term < rf.currentTerm {
 		reply.Success = false
+		rf.mu.Unlock()
 		return reply
 	}
 
@@ -181,20 +182,143 @@ func (rf *Raft) HandleAppendEntries(args *AppendEntriesArgs) *AppendEntriesReply
 	}
 
 	rf.role = string(Follower)
-	reply.Success = true
-	reply.Term = rf.currentTerm
-
 	select {
 	case rf.Heartbeat <- true:
 	default:
 	}
 
+	if args.PrevLogIndex > 0 {
+		if args.PrevLogIndex >= len(rf.logEntries) ||
+			rf.logEntries[args.PrevLogIndex].term != args.PrevLogTerm {
+			rf.mu.Unlock()
+			reply.Success = false
+			return reply
+		}
+	}
+
+	if len(args.Entries) > 0 {
+		rf.logEntries = append(rf.logEntries[:args.PrevLogIndex+1], args.Entries...)
+	}
+
+	apply := []LogEntry{}
+
+	if args.LeaderCommit > rf.commitIndex {
+		rf.commitIndex = min(args.LeaderCommit, len(rf.logEntries)-1)
+		for rf.lastApplied < rf.commitIndex {
+			rf.lastApplied++
+			apply = append(apply, rf.logEntries[rf.lastApplied])
+		}
+	}
+
+	reply.Success = true
+	reply.Term = rf.currentTerm
+	rf.mu.Unlock()
+
+	for _, entry := range apply {
+		rf.applyCh <- entry
+	}
+
 	return reply
+}
+
+func (rf *Raft) SubmitCommand(command string) bool {
+	if rf.IsDead() || !rf.IsLeader() {
+		return false
+	}
+
+	rf.mu.Lock()
+
+	rf.logEntries = append(rf.logEntries, LogEntry{term: rf.currentTerm, Command: command})
+
+	rf.mu.Unlock()
+	var wg sync.WaitGroup
+
+	for peer := range rf.PeerRaft {
+		if rf.PeerRaft[peer].id != rf.id && !rf.PeerRaft[peer].IsDead() {
+			// fmt.Println("sending heartbeat to", rf.PeerRaft[peer].id)
+
+			rf.mu.Lock()
+			prevIndex := rf.nextIndex[peer] - 1
+			args := &AppendEntriesArgs{
+				Term:         rf.currentTerm,
+				LeaderID:     rf.id,
+				LeaderCommit: rf.commitIndex,
+			}
+			args.PrevLogIndex = prevIndex
+			args.PrevLogTerm = rf.logEntries[prevIndex].term
+			args.Entries = rf.logEntries[prevIndex+1:]
+			rf.mu.Unlock()
+
+			wg.Add(1)
+
+			go func(peer *Raft) {
+				defer wg.Done()
+				reply := peer.HandleAppendEntries(args)
+
+				rf.mu.Lock()
+				apply := []LogEntry{}
+				if reply.Success {
+					rf.matchIndex[peer.id] = len(rf.logEntries) - 1
+					rf.nextIndex[peer.id] = len(rf.logEntries)
+					apply = rf.incrementCommitIndex()
+				} else {
+					rf.nextIndex[peer.id]--
+				}
+
+				rf.mu.Unlock()
+				for _, entry := range apply {
+					rf.applyCh <- entry
+				}
+
+			}(rf.PeerRaft[peer])
+		}
+	}
+	wg.Wait()
+
+	return true
+}
+
+func (rf *Raft) incrementCommitIndex() []LogEntry {
+
+	for n := len(rf.logEntries) - 1; n > rf.commitIndex; n-- {
+		count := 1
+
+		for peer := range rf.PeerRaft {
+			if rf.PeerRaft[peer].id != rf.id && !rf.PeerRaft[peer].IsDead() {
+				if rf.matchIndex[peer] >= n {
+					count++
+				}
+			}
+		}
+
+		if count >= len(rf.PeerRaft)/2+1 {
+			rf.commitIndex = n
+			break
+		}
+	}
+
+	var apply []LogEntry
+
+	for rf.lastApplied < rf.commitIndex {
+		rf.lastApplied++
+		apply = append(apply, rf.logEntries[rf.lastApplied])
+	}
+
+	return apply
+
 }
 
 func (rf *Raft) MakeLeader() {
 	rf.role = string(Leader)
 	// fmt.Println(rf.id, "I AM THE LEADER")
+	rf.matchIndex = make([]int, len(rf.PeerRaft))
+	rf.nextIndex = make([]int, len(rf.PeerRaft))
+
+	for i := range rf.PeerRaft {
+		rf.nextIndex[i] = len(rf.logEntries)
+		rf.matchIndex[i] = 0
+	}
+
 	rf.sendInitialHeartbeat()
 }
 
@@ -224,6 +348,7 @@ func (rf *Raft) sendHeartbeat(peer *Raft, args *AppendEntriesArgs) {
 
 func (rf *Raft) sendInitialHeartbeat() {
 	// fmt.Println("SENDING INITIAL HEARTBEAT")
+	var wg sync.WaitGroup
 	args := &AppendEntriesArgs{
 		Term:         rf.currentTerm,
 		LeaderID:     rf.id,
@@ -236,9 +361,14 @@ func (rf *Raft) sendInitialHeartbeat() {
 	for peer := range rf.PeerRaft {
 		if rf.PeerRaft[peer].id != rf.id && !rf.PeerRaft[peer].IsDead() {
 			// fmt.Println("sending heartbeat to", rf.PeerRaft[peer].id)
-			go rf.sendHeartbeat(rf.PeerRaft[peer], args)
+			wg.Add(1)
+			go func(peer *Raft) {
+				defer wg.Done()
+				rf.sendHeartbeat(peer, args)
+			}(rf.PeerRaft[peer])
 		}
 	}
+	wg.Wait()
 }
 
 func (rf *Raft) becomeFollower() {
