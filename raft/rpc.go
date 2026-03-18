@@ -1,27 +1,45 @@
 package raft
 
-type RequestVoteArgs struct {
-	Term         int
-	CandidateID  int
-	LastLogIndex int
-	LastLogTerm  int
+import (
+	"fmt"
+	"net"
+	"net/http"
+	"net/rpc"
+)
+
+func (rf *Raft) StartServer(addr string) error {
+	server := rpc.NewServer()
+	err := server.Register(rf)
+
+	if err != nil {
+		fmt.Printf("Error registering RPC server: %v\n", err)
+		return err
+	}
+
+	mux := http.NewServeMux()
+	mux.Handle(rpc.DefaultRPCPath, server)
+
+	listener, err := net.Listen("tcp", addr)
+	if err != nil {
+		fmt.Printf("Error starting RPC server: %v\n", err)
+		return err
+	}
+
+	rf.listener = listener
+
+	go http.Serve(listener, mux)
+
+	return nil
 }
 
-type RequestVoteReply struct {
-	Term        int
-	VoteGranted bool
-}
+func (rf *Raft) callPeer(peerAddr string, method string, args any, reply any) error {
+	client, err := rpc.DialHTTP("tcp", peerAddr)
+	if err != nil {
+		fmt.Printf("Error dialing peer %s: %v\n", peerAddr, err)
+		return err
+	}
 
-type AppendEntriesArgs struct {
-	Term         int
-	LeaderID     int
-	PrevLogIndex int
-	PrevLogTerm  int
-	Entries      []LogEntry
-	LeaderCommit int
-}
+	defer client.Close()
 
-type AppendEntriesReply struct {
-	Term    int
-	Success bool
+	return client.Call(method, args, reply)
 }
