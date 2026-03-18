@@ -9,6 +9,18 @@ import (
 
 // ---- helpers ----
 
+var passed, failed int
+
+func pass(name string) {
+	fmt.Printf("✅ PASS: %s\n", name)
+	passed++
+}
+
+func fail(name, reason string) {
+	fmt.Printf("❌ FAIL: %s — %s\n", name, reason)
+	failed++
+}
+
 func makeCluster(n int) ([]*raft.Raft, []chan raft.LogEntry) {
 	applyChs := make([]chan raft.LogEntry, n)
 	nodes := make([]*raft.Raft, n)
@@ -68,18 +80,6 @@ func waitForApplied(ch chan raft.LogEntry, count int, timeout time.Duration) []r
 		}
 	}
 	return entries
-}
-
-var passed, failed int
-
-func pass(name string) {
-	fmt.Printf("✅ PASS: %s\n", name)
-	passed++
-}
-
-func fail(name, reason string) {
-	fmt.Printf("❌ FAIL: %s — %s\n", name, reason)
-	failed++
 }
 
 // ---- tests ----
@@ -361,6 +361,235 @@ func testCommandReplicatedToFollowers() {
 	pass(name)
 }
 
+// testReplicationBasic checks all alive nodes eventually apply a command
+func testReplicationBasic() {
+	name := "TestReplicationBasic"
+	nodes, applyChs := makeCluster(5)
+	defer killAll(nodes)
+
+	leader := waitForLeader(nodes, 5*time.Second)
+	if leader == nil {
+		fail(name, "no leader elected")
+		return
+	}
+	time.Sleep(300 * time.Millisecond) // let heartbeats stabilize
+
+	leader.SubmitCommand("hello")
+
+	// every alive node should apply it
+	for i, n := range nodes {
+		if n.IsDead() {
+			continue
+		}
+		entries := waitForApplied(applyChs[i], 1, 3*time.Second)
+		if len(entries) == 0 {
+			fail(name, fmt.Sprintf("node %d never applied the command", i))
+			return
+		}
+		if entries[0].Command != "hello" {
+			fail(name, fmt.Sprintf("node %d applied wrong command: %s", i, entries[0].Command))
+			return
+		}
+	}
+	pass(name)
+}
+
+// testReplicationWithDeadFollower checks replication still works when a minority of nodes are dead
+func testReplicationWithDeadFollower() {
+	name := "TestReplicationWithDeadFollower"
+	nodes, applyChs := makeCluster(5)
+	defer killAll(nodes)
+
+	leader := waitForLeader(nodes, 5*time.Second)
+	if leader == nil {
+		fail(name, "no leader elected")
+		return
+	}
+	time.Sleep(300 * time.Millisecond)
+
+	// kill 2 followers — still have quorum with 3 alive
+	killed := 0
+	for _, n := range nodes {
+		if !n.IsDead() && !n.IsLeader() && killed < 2 {
+			fmt.Printf("   Killing follower Node %d\n", n.ID())
+			n.Kill()
+			killed++
+		}
+	}
+
+	ok := leader.SubmitCommand("quorum-cmd")
+	if !ok {
+		fail(name, "SubmitCommand returned false")
+		return
+	}
+
+	// check alive nodes apply it
+	appliedCount := 0
+	for i, n := range nodes {
+		if n.IsDead() {
+			continue
+		}
+		entries := waitForApplied(applyChs[i], 1, 3*time.Second)
+		if len(entries) > 0 && entries[0].Command == "quorum-cmd" {
+			appliedCount++
+			fmt.Printf("   Node %d applied\n", i)
+		}
+	}
+
+	if appliedCount < 3 {
+		fail(name, fmt.Sprintf("only %d nodes applied, expected at least 3", appliedCount))
+		return
+	}
+	pass(name)
+}
+
+// testReplicationFailsWithoutQuorum checks that a command does not get committed
+// when the leader cannot reach a majority
+func testReplicationFailsWithoutQuorum() {
+	name := "TestReplicationFailsWithoutQuorum"
+	nodes, applyChs := makeCluster(5)
+	defer killAll(nodes)
+
+	leader := waitForLeader(nodes, 5*time.Second)
+	if leader == nil {
+		fail(name, "no leader elected")
+		return
+	}
+	time.Sleep(300 * time.Millisecond)
+
+	// kill 3 followers — leader is now isolated, no quorum
+	killed := 0
+	for _, n := range nodes {
+		if !n.IsDead() && !n.IsLeader() && killed < 3 {
+			fmt.Printf("   Killing follower Node %d\n", n.ID())
+			n.Kill()
+			killed++
+		}
+	}
+
+	leader.SubmitCommand("should-not-commit")
+
+	// wait and make sure nothing gets applied to any alive node's applyCh
+	time.Sleep(2 * time.Second)
+	for i, n := range nodes {
+		if n.IsDead() {
+			continue
+		}
+		// drain with a very short timeout — expect nothing
+		entries := waitForApplied(applyChs[i], 1, 200*time.Millisecond)
+		if len(entries) > 0 {
+			fail(name, fmt.Sprintf("node %d applied a command without quorum", i))
+			return
+		}
+	}
+	pass(name)
+}
+
+// testReplicationOrderGuarantee checks that multiple commands are applied
+// in submission order across all nodes
+func testReplicationOrderGuarantee() {
+	name := "TestReplicationOrderGuarantee"
+	nodes, applyChs := makeCluster(5)
+	defer killAll(nodes)
+
+	leader := waitForLeader(nodes, 5*time.Second)
+	if leader == nil {
+		fail(name, "no leader elected")
+		return
+	}
+	time.Sleep(300 * time.Millisecond)
+
+	commands := []string{"first", "second", "third", "fourth", "fifth"}
+	for _, cmd := range commands {
+		if !leader.SubmitCommand(cmd) {
+			fail(name, fmt.Sprintf("SubmitCommand failed for '%s'", cmd))
+			return
+		}
+	}
+
+	// check order on every alive node
+	for i, n := range nodes {
+		if n.IsDead() {
+			continue
+		}
+		entries := waitForApplied(applyChs[i], len(commands), 5*time.Second)
+		if len(entries) != len(commands) {
+			fail(name, fmt.Sprintf("node %d got %d entries, expected %d", i, len(entries), len(commands)))
+			return
+		}
+		for j, e := range entries {
+			if e.Command != commands[j] {
+				fail(name, fmt.Sprintf("node %d entry %d: expected '%s' got '%s'", i, j, commands[j], e.Command))
+				return
+			}
+		}
+		fmt.Printf("   Node %d: order correct\n", i)
+	}
+	pass(name)
+}
+
+// testReplicationAfterLeaderChange checks that a new leader can still
+// replicate commands after the old leader dies
+func testReplicationAfterLeaderChange() {
+	name := "TestReplicationAfterLeaderChange"
+	nodes, applyChs := makeCluster(5)
+	defer killAll(nodes)
+
+	leader := waitForLeader(nodes, 5*time.Second)
+	if leader == nil {
+		fail(name, "no leader elected")
+		return
+	}
+	time.Sleep(300 * time.Millisecond)
+
+	// submit a command under the first leader
+	if !leader.SubmitCommand("before-failover") {
+		fail(name, "first SubmitCommand failed")
+		return
+	}
+
+	// kill the leader
+	fmt.Printf("   Killing leader Node %d\n", leader.ID())
+	nodes[leader.ID()].Kill()
+
+	// wait for new leader
+	newLeader := waitForLeader(nodes, 5*time.Second)
+	if newLeader == nil {
+		fail(name, "no new leader elected after failover")
+		return
+	}
+	fmt.Printf("   New leader: Node %d term=%d\n", newLeader.ID(), newLeader.Term())
+	time.Sleep(300 * time.Millisecond)
+
+	// submit a command under the new leader
+	if !newLeader.SubmitCommand("after-failover") {
+		fail(name, "second SubmitCommand failed on new leader")
+		return
+	}
+
+	// check alive nodes applied both commands in order
+	for i, n := range nodes {
+		if n.IsDead() {
+			continue
+		}
+		entries := waitForApplied(applyChs[i], 2, 5*time.Second)
+		if len(entries) < 2 {
+			fail(name, fmt.Sprintf("node %d only got %d entries", i, len(entries)))
+			return
+		}
+		if entries[0].Command != "before-failover" {
+			fail(name, fmt.Sprintf("node %d entry 0: expected 'before-failover' got '%s'", i, entries[0].Command))
+			return
+		}
+		if entries[1].Command != "after-failover" {
+			fail(name, fmt.Sprintf("node %d entry 1: expected 'after-failover' got '%s'", i, entries[1].Command))
+			return
+		}
+		fmt.Printf("   Node %d: both commands applied in order\n", i)
+	}
+	pass(name)
+}
+
 // ---- main ----
 
 func main() {
@@ -377,10 +606,15 @@ func main() {
 		{"TestSubmitOnNonLeaderFails", testSubmitOnNonLeaderFails},
 		{"TestTermsOnlyIncrease", testTermsOnlyIncrease},
 		{"TestCommandReplicatedToFollowers", testCommandReplicatedToFollowers},
+		{"TestReplicationBasic", testReplicationBasic},
+		{"TestReplicationWithDeadFollower", testReplicationWithDeadFollower},
+		{"TestReplicationFailsWithoutQuorum", testReplicationFailsWithoutQuorum},
+		{"TestReplicationOrderGuarantee", testReplicationOrderGuarantee},
+		{"TestReplicationAfterLeaderChange", testReplicationAfterLeaderChange},
 	}
 
-	passed := 0
-	failed := 0
+	passed = 0
+	failed = 0
 
 	fmt.Println("=== Running Raft Tests ===")
 	fmt.Println()
@@ -393,180 +627,3 @@ func main() {
 
 	fmt.Printf("=== Results: %d passed, %d failed ===\n", passed, failed)
 }
-
-// func main() {
-// 	rand.Seed(time.Now().UnixNano())
-
-// 	const (
-// 		numNodes      = 5
-// 		killRounds    = 6
-// 		roundInterval = 3 * time.Second
-// 	)
-
-// 	applyCh := make(chan raft.LogEntry)
-
-// 	// Create Raft nodes
-// 	rafts := make([]*raft.Raft, numNodes)
-// 	for i := 0; i < numNodes; i++ {
-// 		rafts[i] = raft.NewRaft(i, nil, applyCh)
-// 	}
-
-// 	// Wire peers
-// 	for i := 0; i < numNodes; i++ {
-// 		rafts[i].PeerRaft = rafts
-// 	}
-
-// 	fmt.Println("🚀 Raft cluster started with", numNodes, "nodes")
-
-// 	time.Sleep(3 * time.Second)
-
-// 	for round := 1; round <= killRounds; round++ {
-// 		fmt.Printf("\n🔥 CHAOS ROUND %d 🔥\n", round)
-
-// 		printClusterState(rafts)
-
-// 		victim := chooseRandomAlive(rafts)
-// 		if victim == nil {
-// 			fmt.Println("❌ No alive nodes left")
-// 			break
-// 		}
-
-// 		fmt.Printf("💀 Killing node %d (role=%s)\n", victim.ID(), victim.Role())
-// 		victim.Kill()
-
-// 		time.Sleep(roundInterval)
-// 	}
-
-// 	fmt.Println("\n🧪 Chaos test complete")
-// 	select {}
-// }
-
-// func chooseRandomAlive(rafts []*raft.Raft) *raft.Raft {
-// 	alive := []*raft.Raft{}
-// 	for _, rf := range rafts {
-// 		if !rf.IsDead() {
-// 			alive = append(alive, rf)
-// 		}
-// 	}
-
-// 	if len(alive) == 0 {
-// 		return nil
-// 	}
-
-// 	return alive[rand.Intn(len(alive))]
-// }
-
-// func printClusterState(rafts []*raft.Raft) {
-// 	fmt.Println("Cluster state:")
-// 	for _, rf := range rafts {
-// 		status := "alive"
-// 		if rf.IsDead() {
-// 			status = "dead"
-// 		}
-
-// 		fmt.Printf(
-// 			"  Node %d | role=%s | term=%d | %s\n",
-// 			rf.ID(),
-// 			rf.Role(),
-// 			rf.Term(),
-// 			status,
-// 		)
-// 	}
-// }
-
-// func main() {
-// 	const n = 3
-// 	applyCh := make(chan raft.LogEntry)
-
-// 	peers := []string{
-// 		"node1",
-// 		"node2",
-// 		"node3",
-// 	}
-
-// 	r1 := raft.NewRaft(0, peers, applyCh)
-// 	r2 := raft.NewRaft(1, peers, applyCh)
-// 	r3 := raft.NewRaft(2, peers, applyCh)
-
-// 	peerRaft := []*raft.Raft{
-// 		r1,
-// 		r2,
-// 		r3,
-// 	}
-// 	// peerRaft[rand.Intn(3)].MakeLeader()
-
-// 	r1.PeerRaft = peerRaft
-// 	r2.PeerRaft = peerRaft
-// 	r3.PeerRaft = peerRaft
-
-// 	fmt.Println("🚀 Raft cluster started")
-// 	// Let elections happen
-// 	time.Sleep(3 * time.Second)
-
-// 	leader := findLeader(peerRaft)
-// 	if leader == nil {
-// 		fmt.Println("❌ No leader elected")
-// 		return
-// 	}
-
-// 	fmt.Println("👑 Initial leader:", leader.ID())
-
-// 	// Kill the leader
-// 	fmt.Println("😴 Putting leader to sleep...")
-// 	leader.Kill()
-
-// 	// Wait for re-election
-// 	time.Sleep(3 * time.Second)
-
-// 	newLeader := findLeader(peerRaft)
-// 	if newLeader == nil {
-// 		fmt.Println("❌ No new leader elected")
-// 		return
-// 	}
-
-// 	fmt.Println("👑 New leader elected:", newLeader.ID())
-
-// 	fmt.Println("✅ Election robustness test complete")
-// 	return
-// }
-
-// func findLeader(rafts []*raft.Raft) *raft.Raft {
-// 	for _, rf := range rafts {
-// 		if rf.IsLeader() && !rf.IsDead() {
-// 			return rf
-// 		}
-// 	}
-// 	return nil
-// }
-
-// func main() {
-// 	applyCh := make(chan raft.LogEntry)
-
-// 	peers := []string{
-// 		"node1",
-// 		"node2",
-// 		"node3",
-// 	}
-
-// 	r1 := raft.NewRaft(0, peers, applyCh)
-// 	r2 := raft.NewRaft(1, peers, applyCh)
-// 	r3 := raft.NewRaft(2, peers, applyCh)
-
-// 	peerRaft := []*raft.Raft{
-// 		r1,
-// 		r2,
-// 		r3,
-// 	}
-// 	// peerRaft[rand.Intn(3)].MakeLeader()
-
-// 	r1.PeerRaft = peerRaft
-// 	r2.PeerRaft = peerRaft
-// 	r3.PeerRaft = peerRaft
-
-// 	_ = r1
-// 	_ = r2
-// 	_ = r3
-
-// 	fmt.Println("Raft cluster started")
-// 	time.Sleep(10 * time.Second)
-// }

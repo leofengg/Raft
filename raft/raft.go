@@ -1,7 +1,6 @@
 package raft
 
 import (
-	"fmt"
 	"sync"
 	"time"
 )
@@ -71,7 +70,6 @@ func (rf *Raft) StartElection() {
 	rf.votedFor = rf.id
 	rf.votes = 1
 	rf.currentTerm++
-	fmt.Printf("Node %d: StartElection called, new term=%d\n", rf.id, rf.currentTerm)
 
 	rf.mu.Unlock()
 	req := &RequestVoteArgs{
@@ -92,14 +90,10 @@ func (rf *Raft) StartElection() {
 
 			rf.mu.Lock()
 			defer rf.mu.Unlock()
-			// fmt.Println(rf.role)
 			if rf.role != string(Candidate) {
 				return
 			}
 
-			fmt.Printf("Node %d: vote reply granted=%v votes=%d/%d\n",
-				rf.id, reply.VoteGranted, rf.votes, len(rf.PeerRaft)/2+1)
-			// fmt.Println("here", reply.VoteGranted)
 			if reply.VoteGranted {
 				rf.votes++
 				if rf.votes >= len(rf.PeerRaft)/2+1 {
@@ -111,26 +105,18 @@ func (rf *Raft) StartElection() {
 
 		}()
 	}
-
-	// fmt.Println(rf.id, "starting election", rf.role)
 }
 
 func (rf *Raft) HandleRequestVote(req *RequestVoteArgs, reply *RequestVoteReply) {
 
 	if rf.IsDead() {
-		// fmt.Println(rf.id, "am dead")
 		reply.VoteGranted = false
 		return
 	}
-	// fmt.Println(rf.id, "raft recieving vote request from", req.CandidateID)
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	fmt.Printf("Node %d: got vote req from %d | myTerm=%d reqTerm=%d votedFor=%d\n",
-		rf.id, req.CandidateID, rf.currentTerm, req.Term, rf.votedFor)
-
 	if req.Term < rf.currentTerm {
-		// fmt.Println(rf.id, req.CandidateID, "here2")
 		reply.VoteGranted = false
 		return
 	}
@@ -154,14 +140,12 @@ func (rf *Raft) HandleRequestVote(req *RequestVoteArgs, reply *RequestVoteReply)
 	if !alreadyVoted && logOk {
 		reply.VoteGranted = true
 	} else {
-		// fmt.Println(rf.id, req.CandidateID, "here3")
 		reply.VoteGranted = false
 		return
 	}
 
 	rf.votedFor = req.CandidateID
 	reply.Term = rf.currentTerm
-	// fmt.Println(rf.id, "just voted for ", req.CandidateID, reply.VoteGranted)
 	return
 }
 
@@ -195,13 +179,11 @@ func (rf *Raft) HandleAppendEntries(args *AppendEntriesArgs) *AppendEntriesReply
 			return reply
 		}
 	}
-
 	if len(args.Entries) > 0 {
 		rf.logEntries = append(rf.logEntries[:args.PrevLogIndex+1], args.Entries...)
 	}
 
 	apply := []LogEntry{}
-
 	if args.LeaderCommit > rf.commitIndex {
 		rf.commitIndex = min(args.LeaderCommit, len(rf.logEntries)-1)
 		for rf.lastApplied < rf.commitIndex {
@@ -235,8 +217,6 @@ func (rf *Raft) SubmitCommand(command string) bool {
 
 	for peer := range rf.PeerRaft {
 		if rf.PeerRaft[peer].id != rf.id && !rf.PeerRaft[peer].IsDead() {
-			// fmt.Println("sending heartbeat to", rf.PeerRaft[peer].id)
-
 			rf.mu.Lock()
 			prevIndex := rf.nextIndex[peer] - 1
 			args := &AppendEntriesArgs{
@@ -310,7 +290,6 @@ func (rf *Raft) incrementCommitIndex() []LogEntry {
 
 func (rf *Raft) MakeLeader() {
 	rf.role = string(Leader)
-	// fmt.Println(rf.id, "I AM THE LEADER")
 	rf.matchIndex = make([]int, len(rf.PeerRaft))
 	rf.nextIndex = make([]int, len(rf.PeerRaft))
 
@@ -323,16 +302,15 @@ func (rf *Raft) MakeLeader() {
 }
 
 func (rf *Raft) prepareHeartBeat() {
-	// fmt.Println(rf.id, "preparing heartbeat send")
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	args := &AppendEntriesArgs{
 		Term:         rf.currentTerm,
 		LeaderID:     rf.id,
-		PrevLogIndex: 0,
-		PrevLogTerm:  0,
-		Entries:      nil,
-		LeaderCommit: 0,
+		PrevLogIndex: len(rf.logEntries) - 1,
+		PrevLogTerm:  rf.logEntries[len(rf.logEntries)-1].term,
+		Entries:      rf.logEntries[1:], //send all log entries after dummy log
+		LeaderCommit: rf.commitIndex,
 	}
 
 	for peer := range rf.PeerRaft {
@@ -347,7 +325,6 @@ func (rf *Raft) sendHeartbeat(peer *Raft, args *AppendEntriesArgs) {
 }
 
 func (rf *Raft) sendInitialHeartbeat() {
-	// fmt.Println("SENDING INITIAL HEARTBEAT")
 	var wg sync.WaitGroup
 	args := &AppendEntriesArgs{
 		Term:         rf.currentTerm,
@@ -360,7 +337,6 @@ func (rf *Raft) sendInitialHeartbeat() {
 
 	for peer := range rf.PeerRaft {
 		if rf.PeerRaft[peer].id != rf.id && !rf.PeerRaft[peer].IsDead() {
-			// fmt.Println("sending heartbeat to", rf.PeerRaft[peer].id)
 			wg.Add(1)
 			go func(peer *Raft) {
 				defer wg.Done()
@@ -376,7 +352,6 @@ func (rf *Raft) becomeFollower() {
 	defer rf.mu.Unlock()
 	rf.role = string(Follower)
 	rf.votes = 0
-	fmt.Println("lost election, leader is: ")
 }
 
 func (rf *Raft) ticker() {
@@ -413,7 +388,6 @@ func (rf *Raft) Kill() {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	rf.dead = true
-	// fmt.Println("Raft", rf.id, "killed")
 }
 
 func (rf *Raft) IsDead() bool {
