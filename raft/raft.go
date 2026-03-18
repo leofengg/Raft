@@ -62,7 +62,18 @@ func NewRaft(id int, peers []string, applyCh chan LogEntry) *Raft {
 }
 
 func (rf *Raft) StartElection() {
+	if rf.IsDead() {
+		return
+	}
+
+	rf.mu.Lock()
 	rf.role = string(Candidate)
+	rf.votedFor = rf.id
+	rf.votes = 1
+	rf.currentTerm++
+	fmt.Printf("Node %d: StartElection called, new term=%d\n", rf.id, rf.currentTerm)
+
+	rf.mu.Unlock()
 	req := &RequestVoteArgs{
 		Term:         rf.currentTerm,
 		CandidateID:  rf.id,
@@ -70,7 +81,7 @@ func (rf *Raft) StartElection() {
 		LastLogTerm:  rf.logEntries[len(rf.logEntries)-1].term, //figure out what last log term is
 	}
 
-	for i := range rf.peers {
+	for i := range rf.PeerRaft {
 		if rf.PeerRaft[i].id == rf.id && !rf.PeerRaft[i].IsDead() {
 			continue
 		}
@@ -81,18 +92,19 @@ func (rf *Raft) StartElection() {
 
 			rf.mu.Lock()
 			defer rf.mu.Unlock()
-			fmt.Println(rf.role)
+			// fmt.Println(rf.role)
 			if rf.role != string(Candidate) {
 				return
 			}
-			fmt.Println("here", reply.VoteGranted)
+
+			fmt.Printf("Node %d: vote reply granted=%v votes=%d/%d\n",
+				rf.id, reply.VoteGranted, rf.votes, len(rf.PeerRaft)/2+1)
+			// fmt.Println("here", reply.VoteGranted)
 			if reply.VoteGranted {
 				rf.votes++
-				if rf.votes > len(rf.peers)/(2+1) {
-					select {
-					case rf.BecameLeader <- true:
-					default:
-					}
+				if rf.votes >= len(rf.PeerRaft)/2+1 {
+					rf.role = string(Leader)
+					go rf.MakeLeader()
 				}
 				return
 			}
@@ -100,22 +112,25 @@ func (rf *Raft) StartElection() {
 		}()
 	}
 
-	fmt.Println(rf.id, "starting election", rf.role)
+	// fmt.Println(rf.id, "starting election", rf.role)
 }
 
 func (rf *Raft) HandleRequestVote(req *RequestVoteArgs, reply *RequestVoteReply) {
 
 	if rf.IsDead() {
-		fmt.Println(rf.id, "am dead")
+		// fmt.Println(rf.id, "am dead")
 		reply.VoteGranted = false
 		return
 	}
-	fmt.Println(rf.id, "raft recieving vote request from", req.CandidateID)
+	// fmt.Println(rf.id, "raft recieving vote request from", req.CandidateID)
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
+	fmt.Printf("Node %d: got vote req from %d | myTerm=%d reqTerm=%d votedFor=%d\n",
+		rf.id, req.CandidateID, rf.currentTerm, req.Term, rf.votedFor)
+
 	if req.Term < rf.currentTerm {
-		fmt.Println(rf.id, req.CandidateID, "here2")
+		// fmt.Println(rf.id, req.CandidateID, "here2")
 		reply.VoteGranted = false
 		return
 	}
@@ -133,17 +148,20 @@ func (rf *Raft) HandleRequestVote(req *RequestVoteArgs, reply *RequestVoteReply)
 		myLastTerm = rf.logEntries[myLastIndex].term
 	}
 
-	if (req.LastLogIndex >= myLastIndex && req.LastLogTerm == myLastTerm) || req.LastLogTerm > myLastTerm {
+	alreadyVoted := rf.votedFor != -1 && rf.votedFor != req.CandidateID
+	logOk := req.LastLogTerm > myLastTerm || (req.LastLogTerm == myLastTerm && req.LastLogIndex >= myLastIndex)
+
+	if !alreadyVoted && logOk {
 		reply.VoteGranted = true
 	} else {
-		fmt.Println(rf.id, req.CandidateID, "here3")
+		// fmt.Println(rf.id, req.CandidateID, "here3")
 		reply.VoteGranted = false
 		return
 	}
 
 	rf.votedFor = req.CandidateID
 	reply.Term = rf.currentTerm
-	fmt.Println(rf.id, "just voted for ", req.CandidateID, reply.VoteGranted)
+	// fmt.Println(rf.id, "just voted for ", req.CandidateID, reply.VoteGranted)
 	return
 }
 
@@ -176,12 +194,12 @@ func (rf *Raft) HandleAppendEntries(args *AppendEntriesArgs) *AppendEntriesReply
 
 func (rf *Raft) MakeLeader() {
 	rf.role = string(Leader)
-	fmt.Println(rf.id, "I AM THE LEADER")
+	// fmt.Println(rf.id, "I AM THE LEADER")
 	rf.sendInitialHeartbeat()
 }
 
 func (rf *Raft) prepareHeartBeat() {
-	fmt.Println(rf.id, "preparing heartbeat send")
+	// fmt.Println(rf.id, "preparing heartbeat send")
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	args := &AppendEntriesArgs{
@@ -205,7 +223,7 @@ func (rf *Raft) sendHeartbeat(peer *Raft, args *AppendEntriesArgs) {
 }
 
 func (rf *Raft) sendInitialHeartbeat() {
-	fmt.Println("SENDING INITIAL HEARTBEAT")
+	// fmt.Println("SENDING INITIAL HEARTBEAT")
 	args := &AppendEntriesArgs{
 		Term:         rf.currentTerm,
 		LeaderID:     rf.id,
@@ -217,7 +235,7 @@ func (rf *Raft) sendInitialHeartbeat() {
 
 	for peer := range rf.PeerRaft {
 		if rf.PeerRaft[peer].id != rf.id && !rf.PeerRaft[peer].IsDead() {
-			fmt.Println("sending heartbeat to", rf.PeerRaft[peer].id)
+			// fmt.Println("sending heartbeat to", rf.PeerRaft[peer].id)
 			go rf.sendHeartbeat(rf.PeerRaft[peer], args)
 		}
 	}
@@ -227,6 +245,8 @@ func (rf *Raft) becomeFollower() {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	rf.role = string(Follower)
+	rf.votes = 0
+	fmt.Println("lost election, leader is: ")
 }
 
 func (rf *Raft) ticker() {
@@ -242,18 +262,17 @@ func (rf *Raft) ticker() {
 			rf.prepareHeartBeat()
 		case string(Candidate):
 			select {
-			case <-rf.BecameLeader:
-				rf.mu.Lock()
-				rf.MakeLeader()
-				rf.mu.Unlock()
 			case <-time.After(rf.electionTimeout):
 				rf.becomeFollower()
 			}
 		case string(Follower):
+			rf.electionTimeout = randomTimeout()
 			select {
 			case <-rf.Heartbeat:
 			case <-time.After(rf.electionTimeout):
-				go rf.StartElection()
+				if !rf.IsDead() {
+					go rf.StartElection()
+				}
 			}
 		}
 	}
@@ -264,7 +283,7 @@ func (rf *Raft) Kill() {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	rf.dead = true
-	fmt.Println("Raft", rf.id, "killed")
+	// fmt.Println("Raft", rf.id, "killed")
 }
 
 func (rf *Raft) IsDead() bool {
@@ -280,6 +299,18 @@ func (rf *Raft) IsLeader() bool {
 		return true
 	}
 	return false
+}
+
+func (rf *Raft) Role() string {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	return rf.role
+}
+
+func (rf *Raft) Term() int {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	return rf.currentTerm
 }
 
 func (rf *Raft) ID() int {
