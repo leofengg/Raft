@@ -12,7 +12,7 @@ const (
 
 type LogEntry struct {
 	Term     int
-	logIndex int
+	LogIndex int
 	Command  string
 }
 
