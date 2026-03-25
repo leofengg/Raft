@@ -456,3 +456,9 @@ func (rf *Raft) Term() int {
 func (rf *Raft) ID() int {
 	return rf.id
 }
+
+func (rf *Raft) NextIndex() int {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	return len(rf.logEntries)
+}
