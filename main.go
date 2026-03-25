@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"time"
 
-	"example/raft/raft"
+	"github.com/leofengg/Raft/raft"
 )
 
 // ---- helpers ----
